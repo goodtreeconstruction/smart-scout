@@ -1,66 +1,59 @@
 # Smart Scout V2
 
-Send messages to Claude Desktop via Windows UI Automation. **No debug port required.**
+UIA-based message delivery system for Claude Desktop. Receives messages from Forest Chat via a polling bridge and delivers them into the active Claude Desktop conversation using Windows UI Automation.
 
-## What it does
+## Architecture
 
-Smart Scout watches a message queue (`queue.json`) and delivers messages to Claude Desktop by:
-1. Finding the Claude window via pywinauto (UIA backend)
-2. Waiting for Claude to finish streaming (Stop button detection)
-3. Focusing the window, pasting text via clipboard, pressing Enter
-4. Restoring your previous active window
-
-## Why V2?
-
-V1 required launching Claude Desktop with `--remote-debugging-port=9222` (Chrome DevTools Protocol). This broke constantly — updates wiped the shortcut args, port conflicts with Chrome, etc.
-
-V2 uses Windows UI Automation instead. Works with a normally-launched Claude Desktop. Zero special setup.
-
-## Install
-
-```bash
-pip install pywinauto pyautogui pyperclip
+```
+Forest Chat Hub (5001) → forest_scout_bridge.py (polls /api/read) → state/queue.json → smart_scout.py (UIA paste+Enter)
 ```
 
-## Quick Test
+## Components
 
-```bash
-# Check if Scout can find Claude
-python smart_scout.py window
+| File | Purpose |
+|------|---------|
+| `smart_scout.py` | Core delivery engine - event-driven, UIA-based paste into Claude Desktop |
+| `forest_scout_bridge.py` | Polls Forest Chat for bigc-redwood messages, writes to queue, wakes Scout |
+| `send_rules.py` | Broadcasts Forest Chat protocol rules to all bots |
+| `check_chat.py` | Debug: check recent Forest Chat messages |
+| `check_unread.py` | Debug: check unread messages for bigc-redwood |
+| `notify_forest.py` | Send notifications to Forest Chat |
+| `reply_cypress.py` | Quick reply to Cypress via Forest Chat |
+| `debug_messages.py` | Debug: inspect message state |
 
-# Paste text into Claude's input (won't send)
-python smart_scout.py test
+## Usage
 
-# Send a message
-python smart_scout.py send "Hello from Smart Scout!"
+```powershell
+# Start Scout (event-driven, waits for queue items)
+python -u smart_scout.py start
 
-# Run as background service
-python smart_scout.py start
+# Start Forest Chat bridge (polls every 3s)
+python -u forest_scout_bridge.py
+
+# CLI commands
+python smart_scout.py send "Hello Claude"
+python smart_scout.py paste "Test paste without sending"
+python smart_scout.py queue "Add to queue"
+python smart_scout.py status
 ```
 
-## API
+## Key Behaviors
 
-```python
-from smart_scout import get_scout, add_to_queue
+- **Event-driven**: Sleeps until woken by bridge or 5s fallback tick
+- **Streaming detection**: Waits up to 60s for Stop button to disappear before delivering
+- **Window targeting**: Delivers to active Claude Desktop window (Chrome_WidgetWin_1)
+- **Queue-based**: All messages go through `state/queue.json`
+- **Clipboard-safe**: Preserves and restores clipboard during paste operations
 
-# Add message to queue (auto-wakes scout)
-add_to_queue("ping", "AGENT PING: alpha BUILD:COMPLETE task:001")
+## Dependencies
 
-# Manual control
-scout = get_scout()
-scout.start()       # Start background thread
-scout.wake()        # Wake to check queue
-scout.status()      # Get status dict
-scout.check_ready() # Check if Claude is ready
-scout.stop()        # Graceful shutdown
+```
+pywinauto
+pyautogui
+pyperclip
+requests
 ```
 
-## Event-Driven
+## Related
 
-Scout sleeps until woken — no constant polling. Messages queue up and get combined into a single paste+send when Claude is ready.
-
-## Requirements
-
-- Windows (pywinauto is Windows-only)
-- Python 3.10+
-- Claude Desktop running (no special launch args)
+- [Forest Chat](https://github.com/goodtreeconstruction/forest-chat) - Bot-to-bot communication hub
