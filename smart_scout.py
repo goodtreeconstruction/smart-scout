@@ -61,17 +61,30 @@ class PidLock:
     def __init__(self):
         self.lock_file = STATE_DIR / "scout.pid"
     
+    @staticmethod
+    def _pid_alive(pid: int) -> bool:
+        """Check if a process is alive on Windows."""
+        try:
+            # Use kernel32 OpenProcess — returns 0 if process doesn't exist
+            PROCESS_QUERY_LIMITED = 0x1000
+            handle = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED, False, pid)
+            if handle:
+                ctypes.windll.kernel32.CloseHandle(handle)
+                return True
+            return False
+        except Exception:
+            return False
+
     def acquire(self) -> bool:
         if self.lock_file.exists():
             try:
                 old_pid = int(self.lock_file.read_text().strip())
-                try:
-                    os.kill(old_pid, 0)  # Check if alive
+                if self._pid_alive(old_pid):
                     print(f"[Scout V3] Another scout is running (PID {old_pid})")
                     print(f"[Scout V3] Kill it first: taskkill /F /PID {old_pid}")
                     print(f"[Scout V3] Or use: python smart_scout.py start --force")
                     return False
-                except (OSError, ProcessLookupError):
+                else:
                     print(f"[Scout V3] Removing stale PID file (old PID {old_pid} is dead)")
             except Exception:
                 pass
@@ -746,6 +759,141 @@ if __name__ == "__main__":
         print("(Start scout with 'start' to process queue)")
 
     elif cmd in ("new_chat", "new", "newchat"):
+        scout = get_scout()
+        print("Starting new chat...")
+        result = scout.new_chat()
+        if result:
+            print("OK New chat started!")
+        else:
+            print(f"X Failed: {scout.last_error}")
+
+    else:
+        print(f"Unknown command: {cmd}")
+
+
+# ─────────────────────────────────────────────────────────────────
+# CLI
+# ─────────────────────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if len(sys.argv) < 2:
+        print("Smart Scout V3 — Resilient UIA Backend")
+        print()
+        print("Usage:")
+        print("  python smart_scout.py start          - Run scout (Ctrl+C to stop)")
+        print("  python smart_scout.py start --force   - Kill old instance and start")
+        print("  python smart_scout.py status          - Show readiness status")
+        print("  python smart_scout.py test            - Test paste into Claude input")
+        print("  python smart_scout.py send <msg>      - Paste and send a message")
+        print("  python smart_scout.py queue <msg>     - Add message to queue")
+        print("  python smart_scout.py new_chat        - Start a new chat in Claude")
+        print("  python smart_scout.py window          - Test window discovery")
+        sys.exit(1)
+
+    cmd = sys.argv[1]
+
+    if cmd == "start":
+        lock = PidLock()
+        force = "--force" in sys.argv
+        if force:
+            if not lock.force_acquire():
+                sys.exit(1)
+        else:
+            if not lock.acquire():
+                sys.exit(1)
+        print(f"[Scout V3] PID lock acquired (PID {os.getpid()})")
+
+        scout = get_scout()
+        scout.start()
+        print("Press Ctrl+C to stop...")
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            scout.stop()
+
+    elif cmd == "status":
+        scout = get_scout()
+        print("Checking Claude readiness...")
+        result = scout.check_ready()
+        print(json.dumps(result, indent=2))
+        # Show heartbeat if available
+        hb = STATE_DIR / "heartbeat.json"
+        if hb.exists():
+            print(f"\nHeartbeat: {hb.read_text()}")
+        pid_file = STATE_DIR / "scout.pid"
+        if pid_file.exists():
+            print(f"PID file: {pid_file.read_text().strip()}")
+
+    elif cmd == "window":
+        scout = get_scout()
+        print("Searching for Claude window...")
+        win = scout._find_claude_window()
+        if win:
+            print(f"OK Found: '{win.window_text()}' (class: {win.class_name()})")
+            rect = win.rectangle()
+            print(f"  Position: ({rect.left}, {rect.top}) Size: {rect.width()}x{rect.height()}")
+            buttons = scout._scan_buttons(win)
+            print(f"  Stop button: {buttons['stop_button']}")
+            print(f"  Send button: {buttons['send_button']}")
+            inp = scout._find_input_element(win)
+            if inp:
+                print(f"  Input found: '{inp.element_info.name}'")
+            else:
+                print("  Input: NOT FOUND")
+        else:
+            print("X Claude window not found")
+
+    elif cmd == "test":
+        scout = get_scout()
+        print("Testing paste into Claude input (will NOT send)...")
+        win = scout._find_claude_window()
+        if not win:
+            print("X Claude window not found")
+            sys.exit(1)
+        test_text = "TEST MESSAGE FROM SCOUT V3 — This was pasted via UIA, not CDP!"
+        prev_hwnd = scout._get_foreground_hwnd()
+        result = scout._focus_and_paste(win, test_text)
+        print(f"Paste result: {result}")
+        if result:
+            print("OK Text pasted into input. Check Claude — it should NOT have sent.")
+        scout._restore_window(prev_hwnd)
+
+    elif cmd == "send":
+        if len(sys.argv) < 3:
+            print("Usage: python smart_scout.py send <message>")
+            sys.exit(1)
+        msg = " ".join(sys.argv[2:])
+        scout = get_scout()
+        print(f"Sending: '{msg[:80]}...'")
+        win = scout._find_claude_window()
+        if not win:
+            print("X Claude window not found")
+            sys.exit(1)
+        if scout._has_stop_button(win):
+            print("X Claude is currently streaming — wait for it to finish")
+            sys.exit(1)
+        prev_hwnd = scout._get_foreground_hwnd()
+        if scout._focus_and_paste(win, msg):
+            time.sleep(0.3)
+            if scout._send_enter():
+                print("OK Message sent!")
+            else:
+                print("X Enter key failed")
+        else:
+            print(f"X Paste failed: {scout.last_error}")
+        scout._restore_window(prev_hwnd)
+
+    elif cmd == "queue":
+        if len(sys.argv) < 3:
+            print("Usage: python smart_scout.py queue <message>")
+            sys.exit(1)
+        msg = " ".join(sys.argv[2:])
+        msg_id = add_to_queue("cypress", msg)
+        print(f"Queued: {msg_id}")
+        print("(Start scout with 'start' to process queue)")
+
+    elif cmd in ("new_chat", "new"):
         scout = get_scout()
         print("Starting new chat...")
         result = scout.new_chat()
