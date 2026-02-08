@@ -26,7 +26,7 @@ POLL_INTERVAL = 3  # seconds
 
 # Smart Scout queue
 sys.path.insert(0, str(Path(__file__).parent))
-from smart_scout import add_to_queue
+from smart_scout import add_to_queue, get_scout
 
 
 def poll_and_forward():
@@ -54,6 +54,24 @@ def poll_and_forward():
             msg_id = msg.get("id", "?")
 
             if not content.strip():
+                continue
+
+            # Check for slash commands
+            cmd = content.strip().lower()
+            if cmd in ("/new_chat", "/new", "/newchat"):
+                print(f"[Bridge] Slash command '{cmd}' from {sender} — starting new chat...")
+                scout = get_scout()
+                result = scout.new_chat()
+                # Send confirmation back via Forest Chat
+                status = "New chat started!" if result else f"Failed: {scout.last_error}"
+                try:
+                    requests.post(f"{FOREST_CHAT_URL}/api/send", json={
+                        "from": IDENTITY, "to": sender,
+                        "message": f"[Scout] {status}"
+                    }, timeout=5)
+                except Exception:
+                    pass
+                forwarded += 1
                 continue
 
             # Format for Claude Desktop
