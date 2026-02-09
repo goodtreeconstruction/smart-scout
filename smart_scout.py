@@ -52,6 +52,11 @@ SEND_BUTTON_NAMES = {"Send Message", "Send"}
 # Heartbeat interval
 HEARTBEAT_INTERVAL = 60
 
+# Message throttle settings
+MAX_MESSAGE_AGE_SECONDS = 7200  # 2 hours — discard older messages
+DELIVERY_COOLDOWN = 2  # seconds between delivering individual messages
+MAX_BATCH_SIZE = 5  # max messages to deliver per wake cycle
+
 
 # --- Single Instance PID Lock ---
 
@@ -89,6 +94,9 @@ class PidLock:
             except Exception:
                 pass
         
+        # Scan for orphan smart_scout processes before claiming lock
+        PidLock._kill_orphan_scouts()
+        
         self.lock_file.parent.mkdir(parents=True, exist_ok=True)
         self.lock_file.write_text(str(os.getpid()))
         atexit.register(self.release)
@@ -96,6 +104,7 @@ class PidLock:
     
     def force_acquire(self) -> bool:
         """Kill existing instance and take over."""
+        # Kill PID from lock file
         if self.lock_file.exists():
             try:
                 old_pid = int(self.lock_file.read_text().strip())
@@ -104,7 +113,39 @@ class PidLock:
                 time.sleep(1)
             except Exception:
                 pass
+        # Also scan for any other smart_scout processes (prevents orphans)
+        self._kill_orphan_scouts()
         return self.acquire()
+
+    @staticmethod
+    def _kill_orphan_scouts():
+        """Find and kill any other smart_scout.py processes (not us)."""
+        try:
+            import psutil
+            my_pid = os.getpid()
+            # Get our parent chain to avoid killing our own launcher
+            protected_pids = {my_pid}
+            try:
+                p = psutil.Process(my_pid)
+                protected_pids.add(p.ppid())
+            except Exception:
+                pass
+            
+            for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+                try:
+                    if proc.info['pid'] in protected_pids:
+                        continue
+                    # Only match python processes running smart_scout.py directly
+                    if proc.info.get('name', '').lower() not in ('python.exe', 'python3.exe', 'python'):
+                        continue
+                    cmdline = proc.info.get('cmdline') or []
+                    if any('smart_scout.py' in arg for arg in cmdline):
+                        print(f"[Scout V3] Killing orphan PID {proc.info['pid']}")
+                        proc.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            pass  # psutil not available, skip orphan scan
     
     def release(self):
         try:
@@ -445,6 +486,92 @@ class ScoutService:
     # Main Event Loop (V3 — with heartbeat + new chat persistence)
     # ─────────────────────────────────────────────────────────────
 
+    def _discard_stale_messages(self, pending: List[Dict]) -> List[Dict]:
+        """Remove messages older than MAX_MESSAGE_AGE_SECONDS. Notify senders."""
+        now = datetime.now()
+        fresh = []
+        stale_ids = []
+        for msg in pending:
+            try:
+                ts = datetime.fromisoformat(msg.get("timestamp", ""))
+                age = (now - ts).total_seconds()
+                if age > MAX_MESSAGE_AGE_SECONDS:
+                    stale_ids.append(msg.get("id"))
+                    sender = msg.get("from", "unknown")
+                    print(f"[Scout V3] Discarding stale message {msg.get('id')} ({age:.0f}s old, from {sender})")
+                    continue
+            except Exception:
+                pass
+            fresh.append(msg)
+
+        if stale_ids:
+            self.mark_sent(stale_ids)  # Remove from queue
+            print(f"[Scout V3] Discarded {len(stale_ids)} stale message(s)")
+        return fresh
+
+    def _wait_for_ready(self, win, max_wait=90) -> bool:
+        """Wait for Claude to not be streaming. Returns True if ready, False if timeout.
+        After 30s, actively clicks Stop button to force-stop streaming."""
+        start = time.time()
+        backoff = 1.5
+        clicked_stop = False
+        while time.time() - start < max_wait:
+            if self._stop_event.is_set():
+                return False
+            if not self._has_stop_button(win):
+                return True
+            # After 30s of waiting, try clicking the Stop button
+            elapsed = time.time() - start
+            if elapsed > 30 and not clicked_stop:
+                print("[Scout V3] Still streaming after 30s, clicking Stop button...")
+                if self._click_stop_button(win):
+                    clicked_stop = True
+                    time.sleep(2)  # Give it time to stop
+                    continue
+            time.sleep(backoff)
+            backoff = min(backoff * 1.2, 5)  # Gradually increase, max 5s
+        return False
+
+    def _click_stop_button(self, win) -> bool:
+        """Find and click the Stop button to halt Claude's response."""
+        try:
+            buttons = win.descendants(control_type="Button")
+            for btn in buttons:
+                try:
+                    name = btn.element_info.name or ""
+                    if any(s.lower() in name.lower() for s in STOP_BUTTON_NAMES):
+                        btn.click_input()
+                        print("[Scout V3] Clicked Stop button")
+                        return True
+                except Exception:
+                    continue
+        except Exception as e:
+            self.last_error = f"Click stop error: {e}"
+        return False
+
+    def _verify_chat_target(self, win) -> bool:
+        """Verify we're targeting the correct Claude window/chat.
+        Returns True if the window looks like a valid Claude chat target."""
+        try:
+            title = win.window_text().lower().strip()
+            # Must be a Claude window
+            if "claude" not in title:
+                print(f"[Scout V3] Window title '{title}' doesn't contain 'claude', skipping")
+                return False
+            # Must be the right class
+            if win.class_name() != CLAUDE_CLASS_NAME:
+                print(f"[Scout V3] Window class '{win.class_name()}' doesn't match, skipping")
+                return False
+            # Must have an input element
+            inp = self._find_input_element(win)
+            if not inp:
+                print(f"[Scout V3] No input element found in window, skipping")
+                return False
+            return True
+        except Exception as e:
+            print(f"[Scout V3] Chat target verification failed: {e}")
+            return False
+
     def _run_loop(self):
         """
         Main scout loop (runs in background thread).
@@ -499,74 +626,84 @@ class ScoutService:
                 if not pending:
                     continue
 
-                print(f"[Scout V3] {len(pending)} pending message(s)")
-
-                combined_text = self.build_message_text(pending)
-                if not combined_text.strip():
+                # Discard stale messages (>2hr old)
+                pending = self._discard_stale_messages(pending)
+                if not pending:
                     continue
 
-                # Find Claude window (with cache validation)
-                win = self._find_claude_window()
-                if not win:
-                    self.last_error = "Claude window not found"
-                    print("[Scout V3] X Claude window not found, will retry on next wake")
-                    self._invalidate_window()
-                    continue
+                # Throttle: deliver up to MAX_BATCH_SIZE, one at a time
+                batch = pending[:MAX_BATCH_SIZE]
+                print(f"[Scout V3] {len(pending)} pending, delivering {len(batch)} this cycle")
 
-                # Wait for ready (no Stop button = not streaming)
-                ready_timeout = 60
-                ready_start = time.time()
-                print("[Scout V3] Waiting for Claude to be ready...")
-
-                while time.time() - ready_start < ready_timeout:
+                for msg in batch:
                     if self._stop_event.is_set():
                         break
-                    if not self._has_stop_button(win):
-                        break
-                    time.sleep(1.5)
 
-                if self._stop_event.is_set():
-                    break
-
-                # Re-check — if still streaming, try re-finding window
-                # (might have switched chats)
-                if self._has_stop_button(win):
-                    print(f"[Scout V3] Still streaming after {ready_timeout}s, re-finding window...")
-                    self._invalidate_window()
-                    win = self._find_claude_window()
-                    if win and not self._has_stop_button(win):
-                        print("[Scout V3] Window recovered (maybe chat switched)")
-                    else:
-                        self.last_error = f"Still streaming after {ready_timeout}s timeout"
-                        print(f"[Scout V3] X Claude still streaming, skipping this cycle")
+                    content = msg.get("content", "").strip()
+                    if not content:
+                        self.mark_sent([msg.get("id")])
                         continue
 
-                # Save foreground window to restore after
-                prev_hwnd = self._get_foreground_hwnd()
+                    # Find Claude window (with cache validation)
+                    win = self._find_claude_window()
+                    if not win:
+                        self.last_error = "Claude window not found"
+                        print("[Scout V3] X Claude window not found, will retry on next wake")
+                        self._invalidate_window()
+                        break  # Stop this batch, retry next cycle
 
-                # Focus Claude, clear input, paste combined text
-                print(f"[Scout V3] Pasting {len(combined_text)} chars...")
-                if not self._focus_and_paste(win, combined_text):
-                    print(f"[Scout V3] X Paste failed: {self.last_error}")
-                    # Maybe window went stale — invalidate for next try
-                    self._invalidate_window()
-                    continue
+                    # Verify chat target (Bug 4: don't paste into wrong window)
+                    if not self._verify_chat_target(win):
+                        self._invalidate_window()
+                        print("[Scout V3] X Chat target invalid, re-finding window...")
+                        win = self._find_claude_window()
+                        if not win or not self._verify_chat_target(win):
+                            self.last_error = "No valid Claude chat target"
+                            break
 
-                time.sleep(0.3)
+                    # Wait for ready — retry with backoff (Bug 3)
+                    if not self._wait_for_ready(win, max_wait=90):
+                        # Don't give up — just skip this cycle, messages stay in queue
+                        self.last_error = "Claude still streaming after 90s"
+                        print(f"[Scout V3] X Claude still streaming, requeueing for next cycle")
+                        # Re-wake so we retry soon
+                        self._wake_event.set()
+                        break
 
-                # Send!
-                if self._send_enter():
-                    ids = [p.get("id") for p in pending if p.get("id")]
-                    self.mark_sent(ids)
-                    self.send_count += 1
-                    self.last_sent = datetime.now().isoformat()
-                    print(f"[Scout V3] OK Sent {len(pending)} message(s)")
-                    self.write_heartbeat(state="sent", pending=0)
-                else:
-                    print(f"[Scout V3] X Send failed: {self.last_error}")
+                    # Save foreground window to restore after
+                    prev_hwnd = self._get_foreground_hwnd()
 
-                self._restore_window(prev_hwnd)
-                time.sleep(1)
+                    # Focus Claude, clear input, paste single message
+                    print(f"[Scout V3] Pasting {len(content)} chars...")
+                    if not self._focus_and_paste(win, content):
+                        print(f"[Scout V3] X Paste failed: {self.last_error}")
+                        self._invalidate_window()
+                        break
+
+                    time.sleep(0.3)
+
+                    # Send!
+                    if self._send_enter():
+                        self.mark_sent([msg.get("id")])
+                        self.send_count += 1
+                        self.last_sent = datetime.now().isoformat()
+                        print(f"[Scout V3] OK Sent message {msg.get('id', '?')}")
+                        self.write_heartbeat(state="sent", pending=len(pending) - 1)
+                    else:
+                        print(f"[Scout V3] X Send failed: {self.last_error}")
+                        break
+
+                    self._restore_window(prev_hwnd)
+
+                    # Cooldown between messages (Bug 2: no rapid-fire dumps)
+                    if len(batch) > 1:
+                        print(f"[Scout V3] Cooldown {DELIVERY_COOLDOWN}s before next message...")
+                        time.sleep(DELIVERY_COOLDOWN)
+
+                # If there are still more pending beyond this batch, re-wake
+                if len(pending) > MAX_BATCH_SIZE:
+                    print(f"[Scout V3] {len(pending) - MAX_BATCH_SIZE} more pending, re-waking...")
+                    self._wake_event.set()
 
             except Exception as e:
                 self.last_error = str(e)
