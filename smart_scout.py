@@ -509,45 +509,38 @@ class ScoutService:
             print(f"[Scout V3] Discarded {len(stale_ids)} stale message(s)")
         return fresh
 
-    def _wait_for_ready(self, win, max_wait=90) -> bool:
+    def _wait_for_ready(self, win, max_wait=600) -> bool:
         """Wait for Claude to not be streaming. Returns True if ready, False if timeout.
-        After 30s, actively clicks Stop button to force-stop streaming."""
+        Desktop app — never click Stop, just wait up to 10 min."""
         start = time.time()
-        backoff = 1.5
-        clicked_stop = False
+        backoff = 2
         while time.time() - start < max_wait:
             if self._stop_event.is_set():
                 return False
             if not self._has_stop_button(win):
                 return True
-            # After 30s of waiting, try clicking the Stop button
-            elapsed = time.time() - start
-            if elapsed > 30 and not clicked_stop:
-                print("[Scout V3] Still streaming after 30s, clicking Stop button...")
-                if self._click_stop_button(win):
-                    clicked_stop = True
-                    time.sleep(2)  # Give it time to stop
-                    continue
+            elapsed = int(time.time() - start)
+            if elapsed % 60 < 3:  # Log roughly every minute
+                print(f"[Scout V3] Waiting for streaming to finish... {elapsed}s/{max_wait}s")
             time.sleep(backoff)
-            backoff = min(backoff * 1.2, 5)  # Gradually increase, max 5s
+            backoff = min(backoff * 1.1, 5)
         return False
 
-    def _click_stop_button(self, win) -> bool:
-        """Find and click the Stop button to halt Claude's response."""
+    def _notify_delivery_failure(self, msg, reason):
+        """Post delivery failure to Forest Chat so agents know."""
         try:
-            buttons = win.descendants(control_type="Button")
-            for btn in buttons:
-                try:
-                    name = btn.element_info.name or ""
-                    if any(s.lower() in name.lower() for s in STOP_BUTTON_NAMES):
-                        btn.click_input()
-                        print("[Scout V3] Clicked Stop button")
-                        return True
-                except Exception:
-                    continue
+            import requests as _req
+            fc_url = "http://127.0.0.1:5001/api/send"
+            _req.post(fc_url, json={
+                "from": "smart-scout",
+                "to": msg.get("from", "all"),
+                "message": f"[DELIVERY FAILED] Could not deliver message {msg.get('id','?')} "
+                           f"to BigC-Redwood after 10min. Reason: {reason}. "
+                           f"Message remains in queue for retry."
+            }, timeout=5)
+            print(f"[Scout V3] Notified Forest Chat of delivery failure")
         except Exception as e:
-            self.last_error = f"Click stop error: {e}"
-        return False
+            print(f"[Scout V3] Could not notify Forest Chat: {e}")
 
     def _verify_chat_target(self, win) -> bool:
         """Verify we're targeting the correct Claude window/chat.
@@ -662,10 +655,11 @@ class ScoutService:
                             break
 
                     # Wait for ready — retry with backoff (Bug 3)
-                    if not self._wait_for_ready(win, max_wait=90):
-                        # Don't give up — just skip this cycle, messages stay in queue
-                        self.last_error = "Claude still streaming after 90s"
-                        print(f"[Scout V3] X Claude still streaming, requeueing for next cycle")
+                    if not self._wait_for_ready(win, max_wait=600):
+                        # 10 min timeout — notify Forest Chat
+                        self.last_error = "Claude still streaming after 10min"
+                        print(f"[Scout V3] X Claude still streaming after 10min, notifying Forest Chat")
+                        self._notify_delivery_failure(msg, "Claude streaming for 10+ minutes")
                         # Re-wake so we retry soon
                         self._wake_event.set()
                         break
