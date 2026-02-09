@@ -15,6 +15,8 @@ Stop: Ctrl+C
 import sys
 import time
 import json
+import os
+import atexit
 import requests
 from datetime import datetime
 from pathlib import Path
@@ -23,6 +25,10 @@ from pathlib import Path
 FOREST_CHAT_URL = "http://127.0.0.1:5001"
 IDENTITY = "bigc-redwood"
 POLL_INTERVAL = 3  # seconds
+
+# PID tracking for watchdog
+STATE_DIR = Path(r"C:\Users\Matthew\Documents\claude\smart-scout\state")
+BRIDGE_PID_FILE = STATE_DIR / "bridge.pid"
 
 # Smart Scout queue
 sys.path.insert(0, str(Path(__file__).parent))
@@ -89,8 +95,24 @@ def poll_and_forward():
         print(f"[Bridge] Error: {e}")
         return 0
 
+def write_pid():
+    """Write PID file for watchdog tracking."""
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    BRIDGE_PID_FILE.write_text(str(os.getpid()))
+    atexit.register(cleanup_pid)
+
+def cleanup_pid():
+    try:
+        if BRIDGE_PID_FILE.exists():
+            stored = int(BRIDGE_PID_FILE.read_text().strip())
+            if stored == os.getpid():
+                BRIDGE_PID_FILE.unlink()
+    except Exception:
+        pass
+
 def main():
-    print(f"[Bridge] Forest Chat -> Smart Scout bridge started")
+    write_pid()
+    print(f"[Bridge] Forest Chat -> Smart Scout bridge started (PID {os.getpid()})")
     print(f"[Bridge] Identity: {IDENTITY}")
     print(f"[Bridge] Polling every {POLL_INTERVAL}s for direct messages only")
     print(f"[Bridge] Press Ctrl+C to stop")
