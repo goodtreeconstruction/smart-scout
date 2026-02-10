@@ -422,22 +422,25 @@ class ScoutService:
             return False
 
     def _check_input_empty(self, win) -> bool:
-        """Check if the input field is empty (message was sent)."""
+        """Check if the input field is empty (message was sent).
+        Treats placeholder text like 'Reply...' or 'Write your prompt' as empty."""
+        PLACEHOLDERS = {"reply...", "write your prompt to claude", "write your prompt", ""}
         try:
             inp = self._find_input_element(win)
             if inp is None:
                 return True  # Can't find input, assume sent
-            # Check the value/text of the input
             try:
                 val = inp.get_value()
                 if val is not None:
-                    return len(val.strip()) == 0
+                    cleaned = val.strip().lower()
+                    return cleaned in PLACEHOLDERS or len(cleaned) == 0
             except Exception:
                 pass
             try:
                 texts = inp.texts()
                 if texts:
-                    return all(len(t.strip()) == 0 for t in texts)
+                    combined = " ".join(texts).strip().lower()
+                    return combined in PLACEHOLDERS or len(combined) == 0
             except Exception:
                 pass
             return True  # If we can't read, assume ok
