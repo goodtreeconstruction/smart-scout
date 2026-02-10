@@ -322,7 +322,8 @@ class ScoutService:
     # ─────────────────────────────────────────────────────────────
 
     def _scan_buttons(self, win) -> Dict[str, bool]:
-        """Single scan of all buttons. Returns presence flags."""
+        """Single scan of all buttons. Returns presence flags.
+        Only counts Stop button if it's visible AND enabled (not hidden in DOM)."""
         has_stop = False
         has_send = False
         try:
@@ -332,7 +333,12 @@ class ScoutService:
                     name = btn.element_info.name or ""
                     name_lower = name.lower()
                     if any(s.lower() in name_lower for s in STOP_BUTTON_NAMES):
-                        has_stop = True
+                        # Must be visible AND enabled to count as active
+                        try:
+                            if btn.is_visible() and btn.is_enabled():
+                                has_stop = True
+                        except Exception:
+                            pass  # If we can't check, don't count it
                     if any(s.lower() in name_lower for s in SEND_BUTTON_NAMES):
                         has_send = True
                 except Exception:
@@ -509,21 +515,35 @@ class ScoutService:
             print(f"[Scout V3] Discarded {len(stale_ids)} stale message(s)")
         return fresh
 
+    def _is_input_available(self, win) -> bool:
+        """Check if the text input area exists and is interactive."""
+        try:
+            inp = self._find_input_element(win)
+            if inp is None:
+                return False
+            try:
+                return inp.is_enabled()
+            except Exception:
+                return True
+        except Exception:
+            return False
+
     def _wait_for_ready(self, win, max_wait=600) -> bool:
-        """Wait for Claude to not be streaming. Returns True if ready, False if timeout.
-        Desktop app — never click Stop, just wait up to 10 min."""
+        """Wait for Claude to be ready for input. Returns True if ready, False if timeout.
+        Desktop app — input is always available (even during streaming).
+        Just verify the input element exists with a short settle delay."""
+        # Short settle — give app 1s to stabilize after window focus changes
+        time.sleep(1)
+        if self._is_input_available(win):
+            return True
+        # If input not found, wait briefly and retry (window may be loading)
         start = time.time()
-        backoff = 2
-        while time.time() - start < max_wait:
+        while time.time() - start < min(max_wait, 30):
             if self._stop_event.is_set():
                 return False
-            if not self._has_stop_button(win):
+            time.sleep(2)
+            if self._is_input_available(win):
                 return True
-            elapsed = int(time.time() - start)
-            if elapsed % 60 < 3:  # Log roughly every minute
-                print(f"[Scout V3] Waiting for streaming to finish... {elapsed}s/{max_wait}s")
-            time.sleep(backoff)
-            backoff = min(backoff * 1.1, 5)
         return False
 
     def _notify_delivery_failure(self, msg, reason):
@@ -866,8 +886,8 @@ if __name__ == "__main__":
         if not win:
             print("X Claude window not found")
             sys.exit(1)
-        if scout._has_stop_button(win):
-            print("X Claude is currently streaming — wait for it to finish")
+        if not scout._is_input_available(win):
+            print("X Claude input not available — may be streaming")
             sys.exit(1)
         prev_hwnd = scout._get_foreground_hwnd()
         if scout._focus_and_paste(win, msg):
@@ -1001,8 +1021,8 @@ if __name__ == "__main__":
         if not win:
             print("X Claude window not found")
             sys.exit(1)
-        if scout._has_stop_button(win):
-            print("X Claude is currently streaming — wait for it to finish")
+        if not scout._is_input_available(win):
+            print("X Claude input not available — may be streaming")
             sys.exit(1)
         prev_hwnd = scout._get_foreground_hwnd()
         if scout._focus_and_paste(win, msg):
