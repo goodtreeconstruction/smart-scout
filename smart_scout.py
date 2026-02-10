@@ -421,6 +421,68 @@ class ScoutService:
             self.last_error = f"Enter key error: {e}"
             return False
 
+    def _check_input_empty(self, win) -> bool:
+        """Check if the input field is empty (message was sent)."""
+        try:
+            inp = self._find_input_element(win)
+            if inp is None:
+                return True  # Can't find input, assume sent
+            # Check the value/text of the input
+            try:
+                val = inp.get_value()
+                if val is not None:
+                    return len(val.strip()) == 0
+            except Exception:
+                pass
+            try:
+                texts = inp.texts()
+                if texts:
+                    return all(len(t.strip()) == 0 for t in texts)
+            except Exception:
+                pass
+            return True  # If we can't read, assume ok
+        except Exception:
+            return True
+
+    def _send_with_retry(self, win, max_wait=600) -> bool:
+        """Press Enter and verify it sent. If still streaming, retry until it works.
+        Desktop app ignores Enter during streaming, so we retry periodically."""
+        start = time.time()
+        attempts = 0
+        while time.time() - start < max_wait:
+            if self._stop_event.is_set():
+                return False
+            attempts += 1
+            # Re-focus and press Enter
+            try:
+                win.set_focus()
+                time.sleep(0.2)
+                inp = self._find_input_element(win)
+                if inp:
+                    try:
+                        inp.click_input()
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            
+            pyautogui.press('enter')
+            time.sleep(1.0)
+            
+            # Check if input cleared (message sent)
+            if self._check_input_empty(win):
+                if attempts > 1:
+                    print(f"[Scout V3] Enter accepted after {attempts} attempts ({int(time.time()-start)}s)")
+                return True
+            
+            elapsed = int(time.time() - start)
+            if elapsed % 60 < 6:
+                print(f"[Scout V3] Enter not accepted (streaming?), retrying... {elapsed}s/{max_wait}s")
+            time.sleep(4)
+        
+        return False
+
     def _restore_window(self, prev_hwnd: int):
         """Restore previously focused window after sending."""
         if prev_hwnd:
@@ -674,14 +736,11 @@ class ScoutService:
                             self.last_error = "No valid Claude chat target"
                             break
 
-                    # Wait for ready — retry with backoff (Bug 3)
-                    if not self._wait_for_ready(win, max_wait=600):
-                        # 10 min timeout — notify Forest Chat
-                        self.last_error = "Claude still streaming after 10min"
-                        print(f"[Scout V3] X Claude still streaming after 10min, notifying Forest Chat")
-                        self._notify_delivery_failure(msg, "Claude streaming for 10+ minutes")
-                        # Re-wake so we retry soon
-                        self._wake_event.set()
+                    # Verify input is available (quick check)
+                    if not self._wait_for_ready(win, max_wait=30):
+                        self.last_error = "Input element not found"
+                        print(f"[Scout V3] X Input not available, skipping")
+                        self._invalidate_window()
                         break
 
                     # Save foreground window to restore after
@@ -696,15 +755,18 @@ class ScoutService:
 
                     time.sleep(0.3)
 
-                    # Send!
-                    if self._send_enter():
+                    # Send! Retry Enter until accepted (handles streaming state)
+                    if self._send_with_retry(win, max_wait=600):
                         self.mark_sent([msg.get("id")])
                         self.send_count += 1
                         self.last_sent = datetime.now().isoformat()
                         print(f"[Scout V3] OK Sent message {msg.get('id', '?')}")
                         self.write_heartbeat(state="sent", pending=len(pending) - 1)
                     else:
-                        print(f"[Scout V3] X Send failed: {self.last_error}")
+                        self.last_error = "Enter not accepted after 10min (streaming?)"
+                        print(f"[Scout V3] X Send failed after 10min retry, notifying Forest Chat")
+                        self._notify_delivery_failure(msg, "Enter key not accepted after 10min - Claude may be in long streaming state")
+                        self._wake_event.set()  # Retry soon
                         break
 
                     self._restore_window(prev_hwnd)
